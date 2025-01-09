@@ -121,8 +121,9 @@ class Stripe(ApplePayMixin, BaseClientSidePaymentProcessor):
                 logger.info("*** GETTING STRIPE RESPONSE ***")
                 stripe_response = stripe.PaymentIntent.create(
                     **self._build_payment_intent_parameters(basket),
+                    # NOTE: This parameter does note exist in the Stripe API
                     # This means this payment intent can only be confirmed with secret key (as in, from ecommerce)
-                    secret_key_confirmation='required',
+                    # secret_key_confirmation='required',
                     # don't create a new intent for the same basket
                     idempotency_key=self.generate_basket_pi_idempotency_key(basket),
                 )
