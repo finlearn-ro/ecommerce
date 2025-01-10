@@ -55,7 +55,7 @@ class Stripe(ApplePayMixin, BaseClientSidePaymentProcessor):
         # Stripe client logging level. None will default to INFO.
         self.log_level = configuration['log_level']
         # How many times to automatically retry requests. None means no retries.
-        self.max_network_retries = configuration['max_network_retries']
+        self.max_network_retries = int(configuration['max_network_retries'])
         # Send requests somewhere else instead of Stripe. May be useful for testing.
         self.proxy = configuration['proxy']
         # The key visible on the frontend to identify our Stripe account. Public.
