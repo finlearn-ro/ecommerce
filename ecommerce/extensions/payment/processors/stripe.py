@@ -4,7 +4,6 @@
 import logging
 
 import stripe
-from django.conf import settings
 from oscar.apps.payment.exceptions import GatewayError
 from oscar.core.loading import get_model
 
@@ -68,6 +67,7 @@ class Stripe(ApplePayMixin, BaseClientSidePaymentProcessor):
         self.secret_key = configuration['secret_key']
         # The webhook endpoint secret used by Stripe to secure the endpoint. Private/secret.
         self.endpoint_secret = configuration['webhook_endpoint_secret']
+        self.return_url = configuration['return_url']
 
         stripe.api_key = self.secret_key
         stripe.api_version = self.api_version
@@ -288,7 +288,7 @@ class Stripe(ApplePayMixin, BaseClientSidePaymentProcessor):
         )
 
         # Need a return_url for dynamic payment methods that require action outside of the payment MFE
-        return_url = settings.PAYMENT_MICROFRONTEND_URL
+        return_url = self.return_url
 
         try:
             confirm_api_response = stripe.PaymentIntent.confirm(
