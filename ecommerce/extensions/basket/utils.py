@@ -587,6 +587,39 @@ def apply_voucher_on_basket_and_check_discount(voucher, request, basket):
     basket.clear_vouchers()
     return False, msg
 
+def get_basket_courses_list(basket):
+    """
+    Gets all courses in a basket and returns the course ID and name into a list.
+    If no course is associated to the basket,
+    it will add the product title. At this point, it's expected that the basket is not empty.
+    """
+    courses = []
+    for line in basket.lines.all():
+        try:
+            course_id = line.product.course.id
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                'Failed to retrieve course_id data from basket [%s] for order [%s], adding None',
+                basket.id,
+                basket.order_number
+            )
+            course_id = None
+        try:
+            course_name = line.product.course.name if line.product.course else line.product.title
+        except Exception:  # pylint: disable=broad-except  # pragma: no cover
+            logger.exception(
+                'Failed to retrieve course_name data from basket [%s] for order [%s], adding None',
+                basket.id,
+                basket.order_number
+            )  # pragma: no cover
+            course_name = None  # pragma: no cover
+        course = {
+            'course_id': course_id,
+            'course_name': course_name,
+        }
+        courses.append(course)
+
+    return courses
 
 def is_duplicate_seat_attempt(basket, product):
     """

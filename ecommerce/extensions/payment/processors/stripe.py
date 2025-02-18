@@ -4,6 +4,7 @@
 import logging
 
 import stripe
+from django.conf import settings
 from oscar.apps.payment.exceptions import GatewayError
 from oscar.core.loading import get_model
 
@@ -12,13 +13,15 @@ from ecommerce.extensions.basket.constants import PAYMENT_INTENT_ID_ATTRIBUTE
 from ecommerce.extensions.basket.models import Basket
 from ecommerce.extensions.basket.utils import (
     basket_add_payment_intent_id_attribute,
-    get_billing_address_from_payment_intent_data
+    get_billing_address_from_payment_intent_data,
+    get_basket_courses_list
 )
 from ecommerce.extensions.payment.constants import STRIPE_CARD_TYPE_MAP
 from ecommerce.extensions.payment.processors import (
     ApplePayMixin,
     BaseClientSidePaymentProcessor,
-    HandledProcessorResponse
+    HandledProcessorResponse,
+    InProgressProcessorResponse
 )
 
 logger = logging.getLogger(__name__)
@@ -89,12 +92,62 @@ class Stripe(ApplePayMixin, BaseClientSidePaymentProcessor):
         order_number = basket.order_number
         amount = self._get_basket_amount(basket)
         currency = basket.currency
+
+        courses = get_basket_courses_list(basket)
+        courses_metadata = str(courses)[:499] if courses else None
+
         return {
             'amount': amount,
             'currency': currency,
             'description': order_number,
-            'metadata': {'order_number': order_number},
+            'metadata': {'order_number': order_number, 'courses': courses_metadata},
         }
+
+    def cancel_and_create_new_payment_intent_for_basket(self, basket, payment_intent_id):
+        """
+        Cancel and create a new Stripe payment intent to associate with the current basket.
+        This is used as a reset of the payment to allow payment retries when the intent gets into unexpected states.
+        """
+        try:
+            # Cancel existing Payment Intent
+            stripe.PaymentIntent.cancel(payment_intent_id)
+            logger.info(
+                'Sucessfully cancelled Payment Intent [%s] for basket [%d] and order number [%s]',
+                payment_intent_id,
+                basket.id,
+                basket.order_number,
+            )
+        except stripe.error.InvalidRequestError:
+            logger.info(
+                'InvalidRequestError: Payment Intent [%s] for basket [%d] and order number [%s] '
+                'could not be canceled.',
+                payment_intent_id,
+                basket.id,
+                basket.order_number,
+            )
+
+        # Create a new Payment Intent and add to the basket.
+        # Pls note: idempotency_key is not used because we found that Stripe will "resuscitate" the
+        # Payment Intent and an intent with the same ID would be created - this will fail later on confirm.
+        new_payment_intent = stripe.PaymentIntent.create(
+            **self._build_payment_intent_parameters(basket),
+            # This means this payment intent can only be confirmed with secret key (as in, from ecommerce)
+            secret_key_confirmation='required',
+            # Enable dynamic payment methods, w/o payment method configuration ID due to Custom Actions Beta:
+            # 'allow_redirects' is default to 'always',
+            # 'enabled' is not default to True with CAB, only for Deferred Intents.
+            automatic_payment_methods={'enabled': True},
+        )
+        new_payment_intent_id = new_payment_intent['id']
+        logger.info(
+            'Sucessfully created new Payment Intent [%s] for basket [%d] and order number [%s]',
+            new_payment_intent_id,
+            basket.id,
+            basket.order_number,
+        )
+        basket_add_payment_intent_id_attribute(basket, new_payment_intent_id)
+        # basket_add_dynamic_payment_methods_enabled(basket, new_payment_intent)
+        return new_payment_intent
 
     def generate_basket_pi_idempotency_key(self, basket):
         """
@@ -119,47 +172,105 @@ class Stripe(ApplePayMixin, BaseClientSidePaymentProcessor):
             }
         else:
             try:
-                logger.info("*** GETTING STRIPE RESPONSE ***")
-                stripe_response = stripe.PaymentIntent.create(
-                    **self._build_payment_intent_parameters(basket),
-                    # NOTE: This parameter does note exist in the Stripe API
-                    # This means this payment intent can only be confirmed with secret key (as in, from ecommerce)
-                    # secret_key_confirmation='required',
-                    # don't create a new intent for the same basket
-                    idempotency_key=self.generate_basket_pi_idempotency_key(basket),
-                )
-                logger.info("*** STRIPE RESPONSE %s ***", stripe_response)
-                # id is the payment_intent_id from Stripe
-                transaction_id = stripe_response['id']
-
-                basket_add_payment_intent_id_attribute(basket, transaction_id)
-            # for when basket was already created, but with different amount
-            except stripe.error.IdempotencyError:
-                # if this PI has been created before, we should be able to retrieve
-                # it from Stripe using the payment_intent_id BasketAttribute.
-                # Note that we update the PI's price in handle_processor_response
-                # before hitting the confirm endpoint, so we don't need to do that here
-                payment_intent_id_attribute = BasketAttributeType.objects.get(name=PAYMENT_INTENT_ID_ATTRIBUTE)
-                payment_intent_attr = BasketAttribute.objects.get(
+                # Check if payment intent is in unexpected state, ie. 'requires_action'.
+                # This check is here for the situation where a BNPL is not finalized in a window,
+                # but another window is opened and the checkout page is loaded.
+                # First need to check for the presence of a Payment Intent in the basket.
+                # We need to do this before creating a Payment Intent, even with the idempotency key
+                # because Stripe will change a 'requires_action' status to 'requires_payment_method' if
+                # we call create on it. To avoid that, we must check the status prior to calling create.
+                payment_intent_id = BasketAttribute.objects.get(
                     basket=basket,
-                    attribute_type=payment_intent_id_attribute
-                )
-                transaction_id = payment_intent_attr.value_text.strip()
+                    attribute_type__name=PAYMENT_INTENT_ID_ATTRIBUTE
+                ).value_text
+            except BasketAttribute.DoesNotExist:
+                payment_intent_id = None
+
+            # If the basket has a Payment Intent, get the status
+            if payment_intent_id:
+                stripe_response = stripe.PaymentIntent.retrieve(id=payment_intent_id)
+                status = stripe_response['status']
                 logger.info(
-                    'Idempotency Error: Retrieving existing Payment Intent for basket [%d]'
-                    ' with transaction ID [%s] and order number [%s].',
+                    'Stripe capture-context called for basket [%d] and order number [%s] with '
+                    'existing Payment Intent [%s] with status [%s]',
                     basket.id,
-                    transaction_id,
                     basket.order_number,
+                    payment_intent_id,
+                    status,
                 )
-                stripe_response = stripe.PaymentIntent.retrieve(id=transaction_id)
+                confirmable_statuses = ['requires_payment_method', 'requires_confirmation']
+                if status not in confirmable_statuses:
+                    # Payment Intent is in a non-confirmable status, must create a new one.
+                    # This includes canceled status, since if one is create with idempotency key for an existing
+                    # payment with canceled status, it will not create a new Payment Intent.
+                    stripe_response = self.cancel_and_create_new_payment_intent_for_basket(basket, payment_intent_id)
+                else:
+                    # Update the Payment Intent with the latest item in the cart
+                    stripe.PaymentIntent.modify(
+                        payment_intent_id,
+                        **self._build_payment_intent_parameters(basket),
+                    )
+                # If a Payment Intent exists in a confirmable status, it will skip the below else statement,
+                # aka not create another intent with the idempotency key this time around.
+
+            # The basket does not have a Payment Intent, create one
+            else:
+                try:
+                    stripe_response = stripe.PaymentIntent.create(
+                        **self._build_payment_intent_parameters(basket),
+                        # This means this payment intent can only be confirmed with secret key (as in, from ecommerce)
+                        secret_key_confirmation='required',
+                        # Use idempotency to not create a new intent for the same basket, as
+                        # this endpoint is called every time the checkout page is loaded, otherwise
+                        # it would create a new payment intent every time
+                        idempotency_key=self.generate_basket_pi_idempotency_key(basket),
+                        # Enable dynamic payment methods, w/o payment method configuration ID due to Custom Actions Beta
+                        # 'allow_redirects' is default to 'always'
+                        # 'enabled' is not default to True with CAB, only for Deferred Intents
+                        automatic_payment_methods={'enabled': True},
+                    )
+
+                    # id is the payment_intent_id from Stripe
+                    transaction_id = stripe_response['id']
+
+                    logger.info(
+                        "Capture-context: succesfully created a Stripe Payment Intent [%s] "
+                        "for basket [%s] and order [%s]",
+                        transaction_id,
+                        basket.id,
+                        basket.order_number
+                    )
+
+                    basket_add_payment_intent_id_attribute(basket, transaction_id)
+                    # basket_add_dynamic_payment_methods_enabled(basket, stripe_response)
+
+                # for when basket was already created, but with different amount
+                except stripe.error.IdempotencyError:
+                    # if this PI has been created before, we should be able to retrieve
+                    # it from Stripe using the payment_intent_id BasketAttribute.
+                    # Note that we update the PI's price in handle_processor_response
+                    # before hitting the confirm endpoint, so we don't need to do that here
+                    payment_intent_id_attribute = BasketAttributeType.objects.get(name=PAYMENT_INTENT_ID_ATTRIBUTE)
+                    payment_intent_attr = BasketAttribute.objects.get(
+                        basket=basket,
+                        attribute_type=payment_intent_id_attribute
+                    )
+                    transaction_id = payment_intent_attr.value_text.strip()
+                    logger.info(
+                        'Idempotency Error: Retrieving existing Payment Intent for basket [%d]'
+                        ' with transaction ID [%s] and order number [%s].',
+                        basket.id,
+                        transaction_id,
+                        basket.order_number,
+                    )
+                    stripe_response = stripe.PaymentIntent.retrieve(id=transaction_id)
 
         new_capture_context = {
             'key_id': stripe_response['client_secret'],
             'order_id': basket.order_number,
         }
         return new_capture_context
-
+    
     def get_transaction_parameters(self, basket, request=None, use_client_side_checkout=True, **kwargs):
         return {'payment_page_url': self.client_side_payment_url}
 
@@ -167,6 +278,7 @@ class Stripe(ApplePayMixin, BaseClientSidePaymentProcessor):
         # pretty sure we should simply return/error if basket is None, as not
         # sure what it would mean if there
         payment_intent_id = response['payment_intent_id']
+        # dynamic_payment_methods_enabled = response.get('dynamic_payment_methods_enabled', None)
         # NOTE: In the future we may want to get/create a Customer. See https://stripe.com/docs/api#customers.
 
         # rewrite order amount so it's updated for coupon & quantity and unchanged by the user
@@ -174,25 +286,50 @@ class Stripe(ApplePayMixin, BaseClientSidePaymentProcessor):
             payment_intent_id,
             **self._build_payment_intent_parameters(basket),
         )
+
+        # Need a return_url for dynamic payment methods that require action outside of the payment MFE
+        return_url = settings.PAYMENT_MICROFRONTEND_URL
+
         try:
             confirm_api_response = stripe.PaymentIntent.confirm(
                 payment_intent_id,
                 # stop on complicated payments MFE can't handle yet
                 error_on_requires_action=True,
                 expand=['payment_method'],
+                return_url=return_url,
             )
         except stripe.error.CardError as err:
             self.record_processor_response(err.json_body, transaction_id=payment_intent_id, basket=basket)
             logger.exception('Card Error for basket [%d]: %s}', basket.id, err)
             raise
 
+        logger.info(
+            'Confirmed Stripe payment intent [%s] for basket [%d] and order number [%s], '
+            'with dynamic_payment_methods_enabled [%s] and status [%s].',
+            payment_intent_id,
+            basket.id,
+            basket.order_number,
+            confirm_api_response['status']
+        )
+
+        # If the payment has another status other than 'succeeded', we want to return to the MFE something it can handle
+        if confirm_api_response['status'] == 'requires_action':
+            return InProgressProcessorResponse(
+                basket_id=basket.id,
+                order_number=basket.order_number,
+                status=confirm_api_response['status'],
+                confirmation_client_secret=confirm_api_response['client_secret'],
+                transaction_id=confirm_api_response['id'],
+                payment_method=confirm_api_response['payment_method'],
+                total=confirm_api_response['amount'],
+            )
+
         # proceed only if payment went through
-        # pylint: disable=E1136
         assert confirm_api_response['status'] == "succeeded"
         self.record_processor_response(confirm_api_response, transaction_id=payment_intent_id, basket=basket)
 
         logger.info(
-            'Successfully confirmed Stripe payment intent [%s] for basket [%d] and order number [%s].',
+            'Confirmed Stripe payment intent with succeeded status [%s] for basket [%d] and order number [%s].',
             payment_intent_id,
             basket.id,
             basket.order_number,
@@ -200,7 +337,6 @@ class Stripe(ApplePayMixin, BaseClientSidePaymentProcessor):
 
         total = basket.total_incl_tax
         currency = basket.currency
-        # pylint: disable=E1136
         card_object = confirm_api_response['charges']['data'][0]['payment_method_details']['card']
         card_number = card_object['last4']
         card_type = STRIPE_CARD_TYPE_MAP.get(card_object['brand'])
